@@ -1,0 +1,6 @@
+/target/
+/.index/
+.DS_Store
+__pycache__/
+bench/
+corpus/
