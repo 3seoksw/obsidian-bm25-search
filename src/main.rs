@@ -1,12 +1,14 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, hash_map::DefaultHasher},
     env,
     error::Error,
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
 use tantivy::{
-    Index, TantivyDocument,
+    Index, IndexWriter, TantivyDocument, Term,
     collector::TopDocs,
     doc,
     query::QueryParser,
@@ -131,7 +133,49 @@ fn resolved_destination(path: &Path) -> Result<PathBuf> {
     Ok(resolved_destination(parent)?.join(name))
 }
 
-fn build(vault: &Path, destination: &Path) -> Result<()> {
+const MANIFEST: &str = "osb-manifest.json";
+
+// Remembers what each note looked like when it was indexed, so `sync` can touch only what changed.
+// It lives in the index directory, outside the vault.
+#[derive(Serialize, Deserialize)]
+struct Manifest {
+    vault: PathBuf,
+    files: BTreeMap<String, String>,
+}
+
+// shortcut: DefaultHasher is not guaranteed stable across Rust releases. A change only makes the
+// next sync re-index every note once.
+fn fingerprint(text: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}-{}", hasher.finish(), text.len())
+}
+
+fn read_notes(vault: &Path) -> Result<BTreeMap<String, String>> {
+    let mut paths = Vec::new();
+    markdown_files(vault, &mut paths)?;
+    let mut notes = BTreeMap::new();
+    for path in paths {
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+        let relative = path
+            .strip_prefix(vault)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        notes.insert(relative, text);
+    }
+    Ok(notes)
+}
+
+fn add_note(writer: &IndexWriter, f: &Fields, relative: &str, text: &str) -> Result<()> {
+    for section in sections(text) {
+        writer.add_document(doc!(f.path => relative, f.heading => section.heading,
+            f.body => section.body, f.start => section.start as u64, f.end => section.end as u64))?;
+    }
+    Ok(())
+}
+
+fn locate(vault: &Path, destination: &Path) -> Result<(PathBuf, PathBuf)> {
     let vault = vault.canonicalize()?;
     if !vault.is_dir() {
         return Err("Vault must be a directory".into());
@@ -140,22 +184,27 @@ fn build(vault: &Path, destination: &Path) -> Result<()> {
     if destination.starts_with(&vault) || vault.starts_with(&destination) {
         return Err("Index must be outside the vault, not a parent of it".into());
     }
-    let mut paths = Vec::new();
-    markdown_files(&vault, &mut paths)?;
-    let mut documents = Vec::new();
+    Ok((vault, destination))
+}
+
+fn write_manifest(destination: &Path, manifest: &Manifest) -> Result<()> {
+    let temporary = destination.join(format!("{MANIFEST}.tmp"));
+    fs::write(&temporary, serde_json::to_vec(manifest)?)?;
+    fs::rename(temporary, destination.join(MANIFEST))?;
+    Ok(())
+}
+
+fn fingerprints(notes: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    notes
+        .iter()
+        .map(|(path, text)| (path.clone(), fingerprint(text)))
+        .collect()
+}
+
+fn build(vault: &Path, destination: &Path) -> Result<()> {
+    let (vault, destination) = locate(vault, destination)?;
+    let notes = read_notes(&vault)?;
     let (schema, f) = schema();
-    for path in &paths {
-        let text =
-            fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-        let relative = path
-            .strip_prefix(&vault)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        for section in sections(&text) {
-            documents.push(doc!(f.path => relative.clone(), f.heading => section.heading,
-                f.body => section.body, f.start => section.start as u64, f.end => section.end as u64));
-        }
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -178,17 +227,91 @@ fn build(vault: &Path, destination: &Path) -> Result<()> {
         }
         Index::create_in_dir(&destination, schema)?
     };
-    let mut writer = index.writer::<TantivyDocument>(50_000_000)?;
+    let mut writer: IndexWriter = index.writer(50_000_000)?;
     writer.delete_all_documents()?;
-    let count = documents.len();
-    for document in documents {
-        writer.add_document(document)?;
+    for (relative, text) in &notes {
+        add_note(&writer, &f, relative, text)?;
     }
     writer.commit()?;
     writer.wait_merging_threads()?;
+    let files = notes.len();
+    let manifest = Manifest {
+        vault,
+        files: fingerprints(&notes),
+    };
+    write_manifest(&destination, &manifest)?;
+    let reader = index.reader()?;
+    let sections = reader.searcher().num_docs();
     println!(
         "{}",
-        serde_json::json!({"files": paths.len(), "sections": count, "index": destination})
+        serde_json::json!({"files": files, "sections": sections, "index": destination})
+    );
+    Ok(())
+}
+
+// Brings an existing index up to date by re-indexing only added or edited notes and dropping
+// deleted ones. An index with no manifest (built by an older `index`) or a missing index is
+// built from scratch.
+fn sync(vault: &Path, destination: &Path) -> Result<()> {
+    let (vault, destination) = locate(vault, destination)?;
+    let manifest: Option<Manifest> = fs::read(destination.join(MANIFEST))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let Some(manifest) = manifest.filter(|_| destination.join("meta.json").exists()) else {
+        return build(&vault, &destination);
+    };
+    if manifest.vault != vault {
+        return Err("Index was built from a different vault; run `osb index` to rebuild it".into());
+    }
+    let (schema, f) = schema();
+    let index = Index::open_in_dir(&destination)?;
+    if index.schema() != schema {
+        return Err("Existing index has a different schema".into());
+    }
+    let notes = read_notes(&vault)?;
+    let current = fingerprints(&notes);
+    let changed: Vec<&String> = current
+        .iter()
+        .filter(|(path, hash)| manifest.files.get(*path) != Some(*hash))
+        .map(|(path, _)| path)
+        .collect();
+    let removed: Vec<&String> = manifest
+        .files
+        .keys()
+        .filter(|path| !current.contains_key(*path))
+        .collect();
+    let added = changed
+        .iter()
+        .filter(|path| !manifest.files.contains_key(**path))
+        .count();
+    let updated = changed.len() - added;
+    if !changed.is_empty() || !removed.is_empty() {
+        let mut writer: IndexWriter = index.writer(50_000_000)?;
+        for path in changed.iter().chain(&removed) {
+            writer.delete_term(Term::from_field_text(f.path, path));
+        }
+        for path in &changed {
+            add_note(&writer, &f, path, &notes[*path])?;
+        }
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+        write_manifest(
+            &destination,
+            &Manifest {
+                vault,
+                files: current.clone(),
+            },
+        )?;
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "added": added,
+            "updated": updated,
+            "removed": removed.len(),
+            "unchanged": current.len() - changed.len(),
+            "index": destination,
+        })
     );
     Ok(())
 }
@@ -252,15 +375,17 @@ fn run() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.as_slice() {
         [command, vault, index] if command == "index" => build(Path::new(vault), Path::new(index)),
+        [command, vault, index] if command == "sync" => sync(Path::new(vault), Path::new(index)),
         [command, index, query] if command == "search" => search(Path::new(index), query, 5),
         [command, index, query, flag, limit] if command == "search" && flag == "--limit" => {
             search(Path::new(index), query, limit.parse()?)
         }
         _ => Err(
-            "Usage: osb index <vault> <index> | osb search <index> <query> [--limit 1..50]".into(),
+            "Usage: osb index <vault> <index> | osb sync <vault> <index> | osb search <index> <query> [--limit 1..50]".into(),
         ),
     }
 }
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("osb: {error}");

@@ -167,3 +167,88 @@ fn plain_terms_match_any_term_and_more_matches_rank_first() {
         .collect();
     assert_eq!(headings, ["Both", "Only alpha"]);
 }
+
+fn hits(f: &Fixture, query: &str) -> usize {
+    json(&f.run(&["search", "index", query]))["hits"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn sync_adds_edits_and_removes_only_what_changed() {
+    let f = Fixture::new();
+    fs::write(f.0.join("vault/keep.md"), "keepcanary").unwrap();
+    fs::write(f.0.join("vault/edit.md"), "oldcanary").unwrap();
+    fs::write(f.0.join("vault/gone.md"), "gonecanary").unwrap();
+    json(&f.run(&["index", "vault", "index"]));
+
+    let report = json(&f.run(&["sync", "vault", "index"]));
+    assert_eq!(
+        (
+            report["added"].as_u64(),
+            report["updated"].as_u64(),
+            report["removed"].as_u64(),
+            report["unchanged"].as_u64()
+        ),
+        (Some(0), Some(0), Some(0), Some(3))
+    );
+
+    fs::write(f.0.join("vault/edit.md"), "newcanary").unwrap();
+    fs::write(f.0.join("vault/new.md"), "freshcanary").unwrap();
+    fs::remove_file(f.0.join("vault/gone.md")).unwrap();
+    let report = json(&f.run(&["sync", "vault", "index"]));
+    assert_eq!(
+        (
+            report["added"].as_u64(),
+            report["updated"].as_u64(),
+            report["removed"].as_u64(),
+            report["unchanged"].as_u64()
+        ),
+        (Some(1), Some(1), Some(1), Some(1))
+    );
+    assert_eq!(hits(&f, "oldcanary"), 0);
+    assert_eq!(hits(&f, "gonecanary"), 0);
+    assert_eq!(hits(&f, "newcanary"), 1);
+    assert_eq!(hits(&f, "freshcanary"), 1);
+    assert_eq!(hits(&f, "keepcanary"), 1);
+}
+
+#[test]
+fn sync_does_not_duplicate_an_edited_note_with_several_sections() {
+    let f = Fixture::new();
+    let note = |word: &str| format!("# One\n{word} first\n\n## Two\n{word} second\n");
+    fs::write(f.0.join("vault/multi.md"), note("alpha")).unwrap();
+    json(&f.run(&["index", "vault", "index"]));
+    fs::write(f.0.join("vault/multi.md"), note("beta")).unwrap();
+    json(&f.run(&["sync", "vault", "index"]));
+    assert_eq!(hits(&f, "alpha"), 0);
+    assert_eq!(hits(&f, "beta"), 2);
+}
+
+#[test]
+fn sync_builds_a_missing_index_and_an_index_without_a_manifest() {
+    let f = Fixture::new();
+    fs::write(f.0.join("vault/a.md"), "firstcanary").unwrap();
+    let report = json(&f.run(&["sync", "vault", "index"]));
+    assert_eq!(report["files"], 1);
+    assert_eq!(hits(&f, "firstcanary"), 1);
+
+    fs::remove_file(f.0.join("index/osb-manifest.json")).unwrap();
+    fs::write(f.0.join("vault/b.md"), "secondcanary").unwrap();
+    let report = json(&f.run(&["sync", "vault", "index"]));
+    assert_eq!(report["files"], 2);
+    assert_eq!(hits(&f, "secondcanary"), 1);
+}
+
+#[test]
+fn sync_refuses_an_index_built_from_a_different_vault() {
+    let f = Fixture::new();
+    fs::write(f.0.join("vault/a.md"), "vaultcanary").unwrap();
+    fs::create_dir_all(f.0.join("other")).unwrap();
+    fs::write(f.0.join("other/b.md"), "othercanary").unwrap();
+    json(&f.run(&["index", "vault", "index"]));
+    let result = f.run(&["sync", "other", "index"]);
+    assert!(!result.status.success());
+    assert_eq!(hits(&f, "vaultcanary"), 1);
+}
