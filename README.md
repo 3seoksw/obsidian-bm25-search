@@ -25,20 +25,31 @@ The executable is `target/release/osb`.
 Set the vault path and an index path outside the vault:
 
 ```sh
-export OBSIDIAN_VAULT_PATH="$HOME/Documents/Obsidian"
+export OSB_VAULT_PATH="$HOME/Documents/Obsidian"
 export OSB_INDEX_PATH="$HOME/Library/Caches/obsidian-second-brain/index"
 ```
 
 Build the index:
 
 ```sh
-./target/release/osb index "$OBSIDIAN_VAULT_PATH" "$OSB_INDEX_PATH"
+./target/release/osb index "$OSB_VAULT_PATH" "$OSB_INDEX_PATH"
 ```
 
 Indexing reads non-hidden `.md` files recursively.
 It splits files at ATX headings, omits YAML frontmatter, and ignores headings inside fenced code blocks.
 Unreadable notes and invalid UTF-8 cause the command to fail.
 Rebuilding replaces the existing index.
+
+Bring an existing index up to date:
+
+```sh
+./target/release/osb sync "$OSB_VAULT_PATH" "$OSB_INDEX_PATH"
+```
+
+`sync` re-indexes only added or edited notes and drops deleted ones, and it prints the counts.
+It keeps a manifest of note hashes (`osb-manifest.json`) inside the index directory, never in the vault.
+It builds the index from scratch if none exists or if the index has no manifest, and it refuses an index that was built from a different vault.
+`search` stays read-only and never changes the index.
 
 Search the index:
 
@@ -73,7 +84,7 @@ With all three set, a helper model turns each request into search terms before t
 The helper prompt is `REWRITE_PROMPT` at the top of the adapter. It keeps the question's own words and adds at most four synonyms.
 Without `OSB_REWRITE_MODEL` the tool searches with the agent's own words, and setting it without the other two makes every search fail with an error.
 You must build the executable and the index before the first search.
-When notes change, run the `index` command again.
+The tool never changes the index, so run `osb sync` to pick up new and edited notes.
 
 ## Privacy and limitations
 
@@ -84,11 +95,11 @@ There is no PDF/OCR, filename search, frontmatter tag search, embedding model, o
 - Unicode words are supported, but language-specific segmentation and morphological analysis are not.
 Korean exact-word searches are tested.
 Semantic and multilingual retrieval quality are not established.
-- The index is rebuilt as a whole.
-There is no watcher or incremental update.
-Paths and line ranges can become stale after note edits.
+- `sync` hashes every note on each run, so its cost grows with vault size (about 7 ms for 227 notes when nothing changed).
+There is no file watcher, so the index is only as fresh as the last `sync` or `index`.
+Line ranges in older search results can become stale after note edits.
 
 ## Scope
 
 This project provides the local search tool and an OMP adapter.
-Incremental index refresh, a Hermes adapter, and reviewed LLM-assisted note updates are not built.
+A Hermes adapter and reviewed LLM-assisted note updates are not built.
