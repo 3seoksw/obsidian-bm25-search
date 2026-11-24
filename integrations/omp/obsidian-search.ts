@@ -1,4 +1,19 @@
+import { Text } from "@oh-my-pi/pi-tui";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+type Hit = {
+  path: string;
+  heading: string;
+  start_line: number;
+  end_line: number;
+  excerpt: string;
+};
+type SearchDetails = {
+  query: string;
+  terms: string;
+  searchMs: number;
+  hits: Hit[];
+};
 
 // OMP adapter for `osb search`. All retrieval lives in the osb binary.
 // Load it for one run with: omp -e integrations/omp/obsidian-search.ts
@@ -108,7 +123,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error(
           result.stderr.trim() || `osb exited with ${result.code}`,
         );
-      const hits: { path: string }[] = JSON.parse(result.stdout).hits;
+      const hits: Hit[] = JSON.parse(result.stdout).hits;
       const prefix = rewriteModel ? `Searched for: ${terms}\n` : "";
       return {
         content: [{ type: "text", text: prefix + result.stdout.trim() }],
@@ -117,8 +132,38 @@ export default function (pi: ExtensionAPI) {
           terms,
           searchMs,
           paths: hits.map((hit) => hit.path),
-        },
+          hits,
+        } satisfies SearchDetails & { paths: string[] },
       };
+    },
+    renderCall(args, _options, theme) {
+      const title = theme.fg("toolTitle", theme.bold("Obsidian search"));
+      return new Text(`${title} ${theme.fg("accent", args.query ?? "")}`, 0, 0);
+    },
+    renderResult(result, options, theme) {
+      const details = result.details as SearchDetails | undefined;
+      if (!details) {
+        const message = result.content
+          .map((part) => (part.type === "text" ? part.text : ""))
+          .join("");
+        return new Text(theme.fg("error", message), 0, 0);
+      }
+      const { hits, terms, query, searchMs } = details;
+      const files = new Set(hits.map((hit) => hit.path)).size;
+      const lines = [
+        theme.fg("muted", `${hits.length} hits · ${files} files · ${searchMs} ms`),
+      ];
+      if (terms !== query) lines.push(theme.fg("muted", `terms: ${terms}`));
+      hits.forEach((hit, i) => {
+        const branch = i === hits.length - 1 ? "└─" : "├─";
+        const where = `#${hit.heading} L${hit.start_line}-${hit.end_line}`;
+        lines.push(`${theme.fg("muted", branch)} ${hit.path} ${theme.fg("muted", where)}`);
+        if (options.expanded) {
+          const excerpt = hit.excerpt.replace(/\s+/g, " ").slice(0, 160);
+          lines.push(theme.fg("muted", `│   ${excerpt}`));
+        }
+      });
+      return new Text(lines.join("\n"), 0, 0);
     },
   });
 }
